@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -46,20 +47,26 @@ jobs:
       - name: Build Debug APK (always)
         run: ./gradlew :app:assembleDebug
 
-      - name: Try build Release Bundle (if signing present)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.KEYSTORE_PASSWORD != '' && secrets.KEY_ALIAS != '' && secrets.KEY_PASSWORD != '' }}
+      # ВАЖНО: проверяем секреты внутри скрипта, а не в if:
+      - name: Build Release Bundle if signing secrets present
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
-          echo "SIGNING_STORE_FILE=$GITHUB_WORKSPACE/keystore.jks" >> $GITHUB_ENV
-          echo "SIGNING_STORE_PASSWORD=$KEYSTORE_PASSWORD"         >> $GITHUB_ENV
-          echo "SIGNING_KEY_ALIAS=$KEY_ALIAS"                       >> $GITHUB_ENV
-          echo "SIGNING_KEY_PASSWORD=$KEY_PASSWORD"                 >> $GITHUB_ENV
-          ./gradlew :app:bundleRelease
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && \
+             [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+            echo "SIGNING_STORE_FILE=$GITHUB_WORKSPACE/keystore.jks" >> $GITHUB_ENV
+            echo "SIGNING_STORE_PASSWORD=$KEYSTORE_PASSWORD"         >> $GITHUB_ENV
+            echo "SIGNING_KEY_ALIAS=$KEY_ALIAS"                       >> $GITHUB_ENV
+            echo "SIGNING_KEY_PASSWORD=$KEY_PASSWORD"                 >> $GITHUB_ENV
+            ./gradlew :app:bundleRelease
+          else
+            echo "Signing secrets not present — skipping :app:bundleRelease"
+          fi
 
       - name: Create GitHub Release (+upload)
         uses: ncipollo/release-action@v1
@@ -73,17 +80,22 @@ jobs:
             app/build/outputs/apk/debug/**/*.apk
             app/build/outputs/bundle/release/**/*.aab
 
-      # (опционально) запись в Notion, если секрет/переменная заданы (bootstrap из шага 1 это делает)
+      # Notion — тоже проверяем внутри шага
       - name: Post to Notion (optional)
-        if: ${{ secrets.NOTION_TOKEN != '' && vars.NOTION_DB_RELEASES != '' }}
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB: ${{ vars.NOTION_DB_RELEASES }}
-          TAG:  ${{ github.event.inputs.tag }}
-          VER:  ${{ github.event.inputs.versionName }}
-          URL:  ${{ format('https://github.com/{0}/releases/tag/{1}', github.repository, github.event.inputs.tag) }}
+          TAG:   ${{ github.event.inputs.tag }}
+          VER:   ${{ github.event.inputs.versionName }}
+          URL:   ${{ format('https://github.com/{0}/releases/tag/{1}', github.repository, github.event.inputs.tag) }}
           NOTES: ${{ github.event.inputs.notes }}
         run: |
+          set -euo pipefail
+          if [ -z "${NOTION_TOKEN:-}" ] || [ -z "${NOTION_DB:-}" ]; then
+            echo "Notion token or DB missing — skipping Notion step"
+            exit 0
+          fi
+
           NOW=$(date -u +%FT%TZ)
           DATA=$(jq -n \
             --arg db "$NOTION_DB" \
