@@ -18,13 +18,42 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    defaultConfig {
+        versionName = providers.gradleProperty("VERSION_NAME").orNull ?: "0.0.0"
+        versionCode = providers.gradleProperty("VERSION_CODE").orNull?.toInt() ?: 1
+    }
+
+    signingConfigs {
+        create("release") {
+            // В CI мы создаём keystore.jks из секрета; локально файла может не быть
+            storeFile = file(System.getenv("SIGNING_STORE_FILE") ?: "keystore.jks")
+            storePassword = System.getenv("SIGNING_STORE_PASSWORD")
+            keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+            keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+        }
+    }
+
     buildTypes {
-        release {
-            isMinifyEnabled = false
+        getByName("release") {
+            // рекомендум для прод-сборок
+            isMinifyEnabled = true
+            // по желанию: ужать ресурсы вместе с кодом
+            isShrinkResources = true
+
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+
+            // Подписываем релиз ТОЛЬКО если заданы пароли (чтобы локально не падало)
+            if (!System.getenv("SIGNING_STORE_PASSWORD").isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+
+        // debug оставляем как есть
+        getByName("debug") {
+            // настройки по умолчанию
         }
     }
     compileOptions {
