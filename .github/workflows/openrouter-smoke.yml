@@ -22,18 +22,21 @@ jobs:
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
         run: |
           set -euo pipefail
 
-          # Аккуратная санитизация: убираем CR/LF, края, zero-width. Внутренние пробелы НЕ трогаем (но их быть не должно).
+          # Санитизация ключа (без YAML-каверз и без печати самого значения)
           cleaned="$(printf '%s' "${OPEN_ROUTER_API_KEY-}" \
             | tr -d '\r\n' \
             | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
             | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g')"
 
-          echo "API key length after sanitize: $(printf '%s' "$cleaned" | wc -c)"
+          LEN="$(printf '%s' "$cleaned" | wc -c)"
+          FP="$(printf '%s' "$cleaned" | sha256sum | cut -c1-8)"
+          echo "API key length after sanitize: $LEN"
+          echo "API key fingerprint: $FP"
 
-          # Минимальный auth-запрос (обязателен ключ): если 401 — ключ битый/пустой
           MODEL="${LLM_MODEL:-deepseek/deepseek-r1:free}"
           REQ=$(jq -n --arg m "$MODEL" \
                  '{model:$m, messages:[{"role":"user","content":"ping"}], max_tokens:16, temperature:0.0}')
@@ -41,7 +44,7 @@ jobs:
           RESP=$(curl -sS -w "\n%{http_code}" https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${cleaned}" \
             -H "Content-Type: application/json" \
-            -H "HTTP-Referer: smoke" \
+            -H "HTTP-Referer: ${REPO_URL}" \
             -H "X-Title: OpenRouter Smoke" \
             -d "$REQ")
 
@@ -49,23 +52,28 @@ jobs:
           CODE=$(printf '%s' "$RESP" | tail -n 1)
 
           echo "HTTP: $CODE"
+          echo "Raw body:"
+          echo "$BODY" | jq . || echo "$BODY"
+
           if [ "$CODE" -eq 401 ]; then
-            echo "❌ Unauthorized (401). Проверь секрет OPEN_ROUTER_API_KEY."
-            echo "$BODY" | jq .error || echo "$BODY"
+            echo "❌ Unauthorized (401). Проверь OPEN_ROUTER_API_KEY (пустой/битый) или ограничение по доменам."
             exit 1
           fi
 
-          # Любая другая ошибка — тоже фейлим
+          if [ "$CODE" -eq 403 ]; then
+            echo "❌ Forbidden (403). На ключе включены ограничения 'Allowed sites'. Добавь '${REPO_URL}' или 'https://github.com' в список разрешённых доменов на OpenRouter."
+            exit 1
+          fi
+
           if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
-            echo "❌ OpenRouter returned error:"
-            echo "$BODY" | jq .error
+            echo "❌ OpenRouter returned error."
             exit 1
           fi
 
-          # Проверяем, что пришёл текст
           OUT=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
           if [ -z "$OUT" ]; then
-            echo "❌ No content in response"; echo "$BODY" | jq .; exit 1
+            echo "❌ No content in response."
+            exit 1
           fi
 
           echo "✅ Auth OK. Model: $MODEL; Reply: $(echo "$OUT" | head -c 60)"
