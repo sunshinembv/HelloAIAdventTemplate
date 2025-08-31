@@ -13,13 +13,14 @@ jobs:
       pull-requests: write
 
     steps:
-      - name: Checkout base branch
+      # Чекаутим БАЗОВУЮ ветку (не код из форка) — безопасно для pull_request_target
+      - name: Checkout base branch (safe for forks)
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
 
-      - name: Build prompt (diff base..head без checkout PR-кода)
+      - name: Build prompt (diff base..head without checking out PR code)
         id: build
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -34,7 +35,7 @@ jobs:
           echo "${PR_TITLE:-}" >> PR_CONTEXT.md
           echo -e "\n### PR Body\n${PR_BODY:-}" >> PR_CONTEXT.md
 
-          # Пытаемся подтянуть head-коммит как remote (без checkout кода PR)
+          # Подтягиваем head-коммит как удалённый, но не исполняем код из форка
           git remote add pr "${PR_HEAD_CLONE_URL}"
           if git fetch pr "$HEAD_SHA" --depth=50; then
             echo -e "\n### Diffstat" >> PR_CONTEXT.md
@@ -46,53 +47,109 @@ jobs:
             echo -e "\n_(diff unavailable: cannot fetch head commit)_" >> PR_CONTEXT.md
           fi
 
-          # Ограничим размер контекста
           head -n 400 PR_CONTEXT.md > PR_CTX_TRIMMED.md
 
-      - name: Call LLM (always writes AI_SUMMARY.md)
+      - name: Call LLM (with retries & fallbacks; always writes AI_SUMMARY.md)
         id: llm
         env:
-          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
-          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}   # только из Secrets
+          LLM_MODEL: ${{ vars.LLM_MODEL }}                          # primary (опц.)
+          LLM_FALLBACKS: ${{ vars.LLM_FALLBACKS }}                  # CSV список (опц.)
         run: |
           set -euo pipefail
+
           OUT="_AI summary unavailable_"
 
           # Диагностика в Summary
-          echo "Has OPEN_ROUTER_API_KEY: $([ -n "${OPEN_ROUTER_API_KEY:-}" ] && echo '✅' || echo '⛔')" >> "$GITHUB_STEP_SUMMARY"
-          echo "Model: ${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Has OPEN_ROUTER_API_KEY (secret): $([ -n "${OPEN_ROUTER_API_KEY:-}" ] && echo '✅' || echo '⛔')" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -n "${OPEN_ROUTER_API_KEY:-}" ]; then
-            MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
-
-            SYS='Ты — помощник ревьюера. Сформируй Markdown-ответ:
-            1) Summary — 2–4 пункта.
-            2) Risk & Impact — что может сломаться.
-            3) Test checklist — список чекбоксов.
-            4) Suggested labels — через запятую (feature, bugfix, docs, chore, perf, refactor, test).
-            Коротко и по делу, без преамбул.'
-
-            USR=$(printf "Контекст PR:\n%s" "$(cat PR_CTX_TRIMMED.md)")
-
-            JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$MODEL" \
-              '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
-
-            RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
-              -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "$JSON") || true
-
-            # Если OpenRouter вернул ошибку — выведем её в Summary
-            if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-              echo "OpenRouter error:" >> "$GITHUB_STEP_SUMMARY"
-              echo "$RESP" | jq .error >> "$GITHUB_STEP_SUMMARY"
-            fi
-
-            OUT="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
-            if [ -z "$OUT" ]; then OUT="_AI summary unavailable_"; fi
+          if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
+            printf "%s" "$OUT" > AI_SUMMARY.md
+            exit 0
           fi
 
-          printf "%s" "$OUT" > AI_SUMMARY.md
+          # Модели: primary из vars или дефолт, затем фоллбэки из vars или дефолтный список
+          DEF_PRIMARY="deepseek/deepseek-chat-v3-0324:free"
+          DEF_FALLBACKS="deepseek/deepseek-r1:free"
+          PRIMARY="${LLM_MODEL:-$DEF_PRIMARY}"
+          FALLBACKS="${LLM_FALLBACKS:-$DEF_FALLBACKS}"
+
+          echo "Primary model: ${PRIMARY}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fallbacks: ${FALLBACKS}"   >> "$GITHUB_STEP_SUMMARY"
+
+          SYS='Ты — помощник ревьюера. Сформируй Markdown-ответ:
+          1) Summary — 2–4 пункта.
+          2) Risk & Impact — что может сломаться.
+          3) Test checklist — чекбоксы.
+          4) Suggested labels — через запятую (feature, bugfix, docs, chore, perf, refactor, test).
+          Кратко и по делу, без преамбул.'
+
+          USR=$(printf "Контекст PR:\n%s" "$(cat PR_CTX_TRIMMED.md)")
+
+          call_model() {
+            local M="$1"
+            local JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$M" \
+              '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
+            curl -sS https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
+              -H "X-Title: PR AI Summary" \
+              -d "$JSON"
+          }
+
+          try_models() {
+            local MODELS_CSV="$1"
+            local USED=""
+            IFS=',' read -r -a MODELS <<< "$MODELS_CSV"
+            for M in "${MODELS[@]}"; do
+              M="$(echo "$M" | xargs)" # trim
+              [ -n "$M" ] || continue
+              echo "→ Trying model: $M" >> "$GITHUB_STEP_SUMMARY"
+              # 3 попытки с эксп. бэкоффом (4s, 8s, 16s)
+              for attempt in 1 2 3; do
+                RESP="$(call_model "$M")" || true
+                ERR="$(echo "$RESP" | jq -r '.error.code // empty' 2>/dev/null || true)"
+                if [ -n "$ERR" ]; then
+                  # Логируем ошибку
+                  echo "  attempt #$attempt error:" >> "$GITHUB_STEP_SUMMARY"
+                  echo "$RESP" | jq .error >> "$GITHUB_STEP_SUMMARY"
+                  # Если 429 — подождём и/или пойдём на следующую попытку/модель
+                  if [ "$ERR" = "429" ]; then
+                    sleep $(( 2 ** (attempt + 1) )) # 4/8/16 сек
+                    continue
+                  else
+                    # другая ошибка — попробуем следующую модель
+                    break
+                  fi
+                fi
+                # Пробуем извлечь контент
+                OUT="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
+                if [ -n "$OUT" ]; then
+                  USED="$M"
+                  echo "✓ Succeeded with: $M (attempt $attempt)" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Used model: $M" >> "$GITHUB_STEP_SUMMARY"
+                  echo "::notice title=PR AI Summary::Generated via $M"
+                  printf "%s" "$OUT" > AI_SUMMARY.md
+                  return 0
+                else
+                  # пустой ответ — подождём и переопробуем
+                  sleep $(( 2 ** (attempt + 1) ))
+                fi
+              done
+            done
+            return 1
+          }
+
+          # Сначала — primary, затем фоллбэки
+          if try_models "$PRIMARY"; then
+            :
+          elif try_models "$FALLBACKS"; then
+            :
+          else
+            echo "All models failed (see errors above)." >> "$GITHUB_STEP_SUMMARY"
+            printf "%s" "$OUT" > AI_SUMMARY.md
+          fi
 
       - name: Comment summary
         uses: actions/github-script@v7
