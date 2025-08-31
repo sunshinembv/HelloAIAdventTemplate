@@ -1,7 +1,7 @@
 name: PR AI Summary
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
@@ -11,26 +11,42 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
 
-      - name: Build prompt
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - name: Build prompt (diff base..head без checkout PR-кода)
         id: build
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
         run: |
           set -euo pipefail
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          TITLE="${{ github.event.pull_request.title }}"
-          BODY=$(printf "%s" "${{ github.event.pull_request.body }}" | head -c 5000)
 
-          echo "### PR Title"       > PR_CONTEXT.md
-          echo "$TITLE"            >> PR_CONTEXT.md
-          echo -e "\n### PR Body\n$BODY" >> PR_CONTEXT.md
-          echo -e "\n### Diffstat" >> PR_CONTEXT.md
-          git diff --shortstat "$BASE_SHA" "$HEAD_SHA" >> PR_CONTEXT.md || true
-          echo -e "\n### Commits" >> PR_CONTEXT.md
-          git log --oneline "$BASE_SHA".."$HEAD_SHA" >> PR_CONTEXT.md || true
+          echo "### PR Title" > PR_CONTEXT.md
+          echo "${PR_TITLE:-}" >> PR_CONTEXT.md
+          echo -e "\n### PR Body\n${PR_BODY:-}" >> PR_CONTEXT.md
+
+          # Пытаемся подтянуть head-коммит как remote (без checkout кода PR)
+          git remote add pr "${PR_HEAD_CLONE_URL}"
+          if git fetch pr "$HEAD_SHA" --depth=50; then
+            echo -e "\n### Diffstat" >> PR_CONTEXT.md
+            git diff --shortstat "$BASE_SHA" "$HEAD_SHA" >> PR_CONTEXT.md || true
+
+            echo -e "\n### Commits" >> PR_CONTEXT.md
+            git log --oneline "$BASE_SHA".."$HEAD_SHA" --no-merges -n 100 >> PR_CONTEXT.md || true
+          else
+            echo -e "\n_(diff unavailable: cannot fetch head commit)_" >> PR_CONTEXT.md
+          fi
+
+          # Ограничим размер контекста
           head -n 400 PR_CONTEXT.md > PR_CTX_TRIMMED.md
 
       - name: Call LLM (always writes AI_SUMMARY.md)
@@ -41,23 +57,36 @@ jobs:
         run: |
           set -euo pipefail
           OUT="_AI summary unavailable_"
-          MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
+
+          # Диагностика в Summary
+          echo "Has OPEN_ROUTER_API_KEY: $([ -n "${OPEN_ROUTER_API_KEY:-}" ] && echo '✅' || echo '⛔')" >> "$GITHUB_STEP_SUMMARY"
+          echo "Model: ${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}" >> "$GITHUB_STEP_SUMMARY"
 
           if [ -n "${OPEN_ROUTER_API_KEY:-}" ]; then
+            MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
+
             SYS='Ты — помощник ревьюера. Сформируй Markdown-ответ:
-            1) Summary (2–4 пункта).
-            2) Risk & Impact (что может сломаться).
-            3) Test checklist (чекбоксами).
-            4) Suggested labels (из: feature, bugfix, docs, chore, perf, refactor, test).'
+            1) Summary — 2–4 пункта.
+            2) Risk & Impact — что может сломаться.
+            3) Test checklist — список чекбоксов.
+            4) Suggested labels — через запятую (feature, bugfix, docs, chore, perf, refactor, test).
+            Коротко и по делу, без преамбул.'
 
             USR=$(printf "Контекст PR:\n%s" "$(cat PR_CTX_TRIMMED.md)")
+
             JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$MODEL" \
               '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
 
             RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
               -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
               -H "Content-Type: application/json" \
-              -d "$JSON")
+              -d "$JSON") || true
+
+            # Если OpenRouter вернул ошибку — выведем её в Summary
+            if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+              echo "OpenRouter error:" >> "$GITHUB_STEP_SUMMARY"
+              echo "$RESP" | jq .error >> "$GITHUB_STEP_SUMMARY"
+            fi
 
             OUT="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
             if [ -z "$OUT" ]; then OUT="_AI summary unavailable_"; fi
@@ -84,7 +113,8 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const text = fs.readFileSync('AI_SUMMARY.md','utf8');
+            let text = '';
+            try { text = fs.readFileSync('AI_SUMMARY.md','utf8'); } catch(e) {}
             const m = text.match(/Suggested labels:\s*(.+)/i);
             if (m) {
               const labels = m[1].split(',').map(s => s.trim()).filter(Boolean);
