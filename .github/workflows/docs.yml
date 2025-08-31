@@ -23,32 +23,57 @@ jobs:
         run: |
           set -euo pipefail
 
+          task=""; out=""
+
+          ./gradlew -q tasks --all > tasks.txt
+
           detect() {
-            ./gradlew -q tasks --all > tasks.txt
-            if grep -qE '^dokkaHtml[[:space:]]' tasks.txt; then
+            # Нормализуем переносы
+            sed -e 's/\r$//g' tasks.txt > tasks_norm.txt
+
+            # 1) Корневая задача dokkaHtml
+            if grep -qE '(^|[:[:space:]])dokkaHtml([[:space:]]|-)' tasks_norm.txt; then
               echo "task=dokkaHtml"
               echo "out=build/dokka/html"
               return 0
             fi
-            if grep -qE '^dokkaHtmlMultiModule[[:space:]]' tasks.txt; then
+
+            # 2) Мульти-модульная
+            if grep -qE '(^|[:[:space:]])dokkaHtmlMultiModule([[:space:]]|-)' tasks_norm.txt; then
               echo "task=dokkaHtmlMultiModule"
               echo "out=build/dokka/htmlMultiModule"
               return 0
             fi
-            if grep -qE '^[[:space:]]*:app:dokkaHtml[[:space:]]' tasks.txt; then
+
+            # 3) Модуль app
+            if grep -qE '(^|[:[:space:]])(:app:)?dokkaHtml([[:space:]]|-)' tasks_norm.txt; then
               echo "task=:app:dokkaHtml"
               echo "out=app/build/dokka/html"
               return 0
             fi
+
             return 1
           }
 
-          eval "$(detect)" || { echo "No Dokka task found. Did you apply the plugin?"; cat tasks.txt; exit 1; }
+          if DETECT_OUT="$(detect)"; then
+            eval "$DETECT_OUT"
+          else
+            echo "No Dokka task found. Did you apply the plugin?"
+            echo "Hint: in app/build.gradle.kts add:  plugins { id(\"org.jetbrains.dokka\") }"
+            echo "------ tasks.txt (first 200 lines) ------"
+            head -n 200 tasks.txt || true
+            exit 1
+            # Если хочешь мягко пропустить вместо ошибки:
+            # echo "OUT_DIR=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # Гарантируем, что обе переменные заданы
+          : "${task:?}"; : "${out:?}"
+
           echo "Using task: $task"
-          ./gradlew "$task"
+          ./gradlew --no-daemon "$task"
 
           echo "OUT_DIR=$out" >> "$GITHUB_OUTPUT"
-
       # 2) Собираем контекст изменений (для краткой AI-выжимки фич)
       - name: Collect recent changes
         run: |
