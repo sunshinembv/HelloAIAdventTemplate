@@ -10,78 +10,33 @@ permissions:
 jobs:
   docs:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "21" }
       - uses: gradle/actions/setup-gradle@v3
 
-      # 1) Собираем Dokka, авто-определяем доступную задачу и выходной каталог
       - name: Build Dokka (auto-detect task)
         id: dokka
         run: |
           set -euo pipefail
-
           task=""; out=""
-
           ./gradlew -q tasks --all > tasks.txt
-
-          detect() {
-            # Нормализуем переносы
-            sed -e 's/\r$//g' tasks.txt > tasks_norm.txt
-
-            # 1) Корневая задача dokkaHtml
-            if grep -qE '(^|[:[:space:]])dokkaHtml([[:space:]]|-)' tasks_norm.txt; then
-              echo "task=dokkaHtml"
-              echo "out=build/dokka/html"
-              return 0
-            fi
-
-            # 2) Мульти-модульная
-            if grep -qE '(^|[:[:space:]])dokkaHtmlMultiModule([[:space:]]|-)' tasks_norm.txt; then
-              echo "task=dokkaHtmlMultiModule"
-              echo "out=build/dokka/htmlMultiModule"
-              return 0
-            fi
-
-            # 3) Модуль app
-            if grep -qE '(^|[:[:space:]])(:app:)?dokkaHtml([[:space:]]|-)' tasks_norm.txt; then
-              echo "task=:app:dokkaHtml"
-              echo "out=app/build/dokka/html"
-              return 0
-            fi
-
-            return 1
-          }
-
-          if DETECT_OUT="$(detect)"; then
-            eval "$DETECT_OUT"
-          else
-            echo "No Dokka task found. Did you apply the plugin?"
-            echo "Hint: in app/build.gradle.kts add:  plugins { id(\"org.jetbrains.dokka\") }"
-            echo "------ tasks.txt (first 200 lines) ------"
-            head -n 200 tasks.txt || true
-            exit 1
-            # Если хочешь мягко пропустить вместо ошибки:
-            # echo "OUT_DIR=" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-
-          # Гарантируем, что обе переменные заданы
-          : "${task:?}"; : "${out:?}"
-
+          sed -e 's/\r$//g' tasks.txt > tasks_norm.txt
+          if grep -qE '(^|[:[:space:]])dokkaHtml([[:space:]]|-)' tasks_norm.txt; then task="dokkaHtml"; out="build/dokka/html"; fi
+          if [ -z "$task" ] && grep -qE '(^|[:[:space:]])dokkaHtmlMultiModule([[:space:]]|-)' tasks_norm.txt; then task="dokkaHtmlMultiModule"; out="build/dokka/htmlMultiModule"; fi
+          if [ -z "$task" ] && grep -qE '(^|[:[:space:]])(:app:)?dokkaHtml([[:space:]]|-)' tasks_norm.txt; then task=":app:dokkaHtml"; out="app/build/dokka/html"; fi
+          : "${task:?No Dokka task found. Did you apply the plugin?}"
           echo "Using task: $task"
           ./gradlew --no-daemon "$task"
-
           echo "OUT_DIR=$out" >> "$GITHUB_OUTPUT"
-      # 2) Собираем контекст изменений (для краткой AI-выжимки фич)
+
       - name: Collect recent changes
         run: |
           set -euo pipefail
           git fetch --tags --depth=1 || true
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..HEAD"; else RANGE=""; fi
-
           echo "### Changes since $LAST_TAG" > DOCS_CONTEXT.md
           if [ -n "$RANGE" ]; then
             git --no-pager log $RANGE --pretty=format:'- %s' >> DOCS_CONTEXT.md
@@ -90,35 +45,65 @@ jobs:
           fi
           head -n 300 DOCS_CONTEXT.md > DOCS_CTX_TRIMMED.md
 
-      # 3) Короткая AI-выжимка "Key Features" (бесплатная модель по умолчанию)
-      - name: AI Key Features (short)
+      - name: AI Key Features (short, with fallback r1)
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_FALLBACKS: ${{ vars.LLM_FALLBACKS }}
         run: |
           set -euo pipefail
           mkdir -p docs
-          if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
+          sanitize_one_line() {
+            printf '%s' "${1-}" | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//'
+          }
+          API_KEY="$(sanitize_one_line "${OPEN_ROUTER_API_KEY-}")"
+          if [ -z "$API_KEY" ]; then
             echo "- Bug fixes and improvements." > docs/KEY_FEATURES.md
-          else
-            MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
-            SYS='Сформируй раздел "**Key Features**" (5–7 bullets) по последним изменениям. Только маркированный список (Markdown).'
-            USR=$(cat DOCS_CTX_TRIMMED.md)
+            exit 0
+          fi
+          DEF_PRIMARY="deepseek/deepseek-chat-v3-0324:free"
+          DEF_FALLBACKS="deepseek/deepseek-r1:free"
+          PRIMARY="${LLM_MODEL:-$DEF_PRIMARY}"
+          FALLBACKS="${LLM_FALLBACKS:-$DEF_FALLBACKS}"
 
-            JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$MODEL" \
+          SYS='Сформируй раздел "**Key Features**" (5–7 bullets) по последним изменениям. Только маркированный список (Markdown).'
+          USR=$(cat DOCS_CTX_TRIMMED.md)
+
+          call_model() {
+            local M="$1"
+            local JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$M" \
               '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
-
-            RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
-              -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
+            curl -sS https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer ${API_KEY}" \
               -H "Content-Type: application/json" \
-              -d "$JSON") || true
+              -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
+              -H "X-Title: Docs Key Features" \
+              -d "$JSON"
+          }
 
-            OUT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
-            if [ -z "$OUT" ]; then OUT="- Bug fixes and improvements."; fi
-            printf "%s\n" "$OUT" > docs/KEY_FEATURES.md
+          try_models() {
+            local MODELS_CSV="$1"
+            IFS=',' read -r -a MODELS <<< "$MODELS_CSV"
+            for M in "${MODELS[@]}"; do
+              M="$(echo "$M" | xargs)"; [ -n "$M" ] || continue
+              for attempt in 1 2 3; do
+                RESP="$(call_model "$M")" || true
+                ERR_CODE="$(echo "$RESP" | jq -r '.error.code // empty' 2>/dev/null || true)"
+                if [ -n "$ERR_CODE" ]; then
+                  if [ "$ERR_CODE" = "429" ]; then sleep $(( 2 ** (attempt + 1) )); continue; else break; fi
+                fi
+                OUT="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
+                if [ -n "$OUT" ]; then printf "%s\n" "$OUT" > docs/KEY_FEATURES.md; return 0; fi
+                sleep $(( 2 ** (attempt + 1) ))
+              done
+            done
+            return 1
+          }
+
+          if try_models "$PRIMARY"; then :; elif try_models "$FALLBACKS"; then :; else
+            echo "- Bug fixes and improvements." > docs/KEY_FEATURES.md
           fi
 
-      # 4) Готовим папку для публикации (берём OUT_DIR из шага Dokka)
       - name: Prepare site
         run: |
           set -euo pipefail
@@ -126,7 +111,6 @@ jobs:
           cp -R "${{ steps.dokka.outputs.OUT_DIR }}"/* public/ || true
           cp docs/KEY_FEATURES.md public/KEY_FEATURES.md
 
-      # 5) Публикация на GitHub Pages
       - name: Deploy to GitHub Pages (gh-pages)
         uses: peaceiris/actions-gh-pages@v3
         with:

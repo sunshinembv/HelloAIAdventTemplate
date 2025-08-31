@@ -18,16 +18,20 @@ jobs:
           fi
           echo "✅ Secret OPEN_ROUTER_API_KEY is present."
 
-      - name: Call OpenRouter /models
+      - name: Sanitize and call OpenRouter /models
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
         run: |
           set -euo pipefail
+          sanitize_one_line() {
+            printf '%s' "${1-}" | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//'
+          }
+          API_KEY="$(sanitize_one_line "${OPEN_ROUTER_API_KEY-}")"
+          echo "API key length after sanitize: $(printf '%s' "$API_KEY" | wc -c)"
           RESP=$(curl -sS https://openrouter.ai/api/v1/models \
-            -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
+            -H "Authorization: Bearer ${API_KEY}" \
             -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
             -H "X-Title: OpenRouter Smoke")
-          # В случае ошибки OpenRouter вернёт { "error": {...} }
           if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
             echo "OpenRouter returned error:"; echo "$RESP" | jq .error; exit 1
           fi
