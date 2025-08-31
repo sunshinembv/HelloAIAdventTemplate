@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
-NEW="${1:?pass new versionName like 1.2.3}"
-PROP="gradle.properties"
+NEW_VER="${1:-}"
+[ -n "$NEW_VER" ] || { echo "Usage: $0 <versionName>"; exit 1; }
 
-# VERSION_NAME
-if grep -q '^VERSION_NAME=' "$PROP"; then
-  sed -i.bak "s/^VERSION_NAME=.*/VERSION_NAME=${NEW}/" "$PROP"
+PROP_FILE="gradle.properties"
+[ -f "$PROP_FILE" ] || touch "$PROP_FILE"
+
+# Читаем текущий VERSION_CODE (по умолчанию 1)
+CUR_CODE="$(grep -E '^VERSION_CODE=' "$PROP_FILE" | cut -d= -f2 || true)"
+if [[ -z "$CUR_CODE" || ! "$CUR_CODE" =~ ^[0-9]+$ ]]; then CUR_CODE=0; fi
+NEXT_CODE=$((CUR_CODE+1))
+
+# Обновляем/добавляем свойства
+if grep -q '^VERSION_NAME=' "$PROP_FILE"; then
+  sed -i.bak -E "s/^VERSION_NAME=.*/VERSION_NAME=${NEW_VER}/" "$PROP_FILE"
 else
-  echo "VERSION_NAME=${NEW}" >> "$PROP"
+  echo "VERSION_NAME=${NEW_VER}" >> "$PROP_FILE"
 fi
 
-# VERSION_CODE +1
-if grep -q '^VERSION_CODE=' "$PROP"; then
-  CUR=$(grep '^VERSION_CODE=' "$PROP" | cut -d= -f2)
-  NEXT=$((CUR+1))
-  sed -i.bak "s/^VERSION_CODE=.*/VERSION_CODE=${NEXT}/" "$PROP"
+if grep -q '^VERSION_CODE=' "$PROP_FILE"; then
+  sed -i.bak -E "s/^VERSION_CODE=.*/VERSION_CODE=${NEXT_CODE}/" "$PROP_FILE"
 else
-  echo "VERSION_CODE=1" >> "$PROP"
+  echo "VERSION_CODE=${NEXT_CODE}" >> "$PROP_FILE"
 fi
+
+echo "Set VERSION_NAME=${NEW_VER}, VERSION_CODE=${NEXT_CODE}"
