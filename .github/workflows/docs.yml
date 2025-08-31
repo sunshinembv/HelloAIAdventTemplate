@@ -45,7 +45,7 @@ jobs:
           fi
           head -n 300 DOCS_CONTEXT.md > DOCS_CTX_TRIMMED.md
 
-      - name: AI Key Features (short, with fallback r1)
+      - name: AI Key Features (short, fallback r1)
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
@@ -53,11 +53,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p docs
-          sanitize_one_line() {
-            printf '%s' "${1-}" | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//'
-          }
-          API_KEY="$(sanitize_one_line "${OPEN_ROUTER_API_KEY-}")"
-          if [ -z "$API_KEY" ]; then
+          cleaned="$(printf '%s' "${OPEN_ROUTER_API_KEY-}" \
+            | tr -d '\r\n' \
+            | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
+            | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g; s/\p{Space}//g')"
+          if [ -z "$cleaned" ]; then
             echo "- Bug fixes and improvements." > docs/KEY_FEATURES.md
             exit 0
           fi
@@ -74,7 +74,7 @@ jobs:
             local JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$M" \
               '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
             curl -sS https://openrouter.ai/api/v1/chat/completions \
-              -H "Authorization: Bearer ${API_KEY}" \
+              -H "Authorization: Bearer ${cleaned}" \
               -H "Content-Type: application/json" \
               -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
               -H "X-Title: Docs Key Features" \

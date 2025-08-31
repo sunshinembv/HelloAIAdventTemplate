@@ -55,17 +55,18 @@ jobs:
           set -euo pipefail
           OUT="_AI summary unavailable_"
 
-          # Defaults: primary v3, fallback r1
           DEF_PRIMARY="deepseek/deepseek-chat-v3-0324:free"
           DEF_FALLBACKS="deepseek/deepseek-r1:free"
           PRIMARY="${LLM_MODEL:-$DEF_PRIMARY}"
           FALLBACKS="${LLM_FALLBACKS:-$DEF_FALLBACKS}"
 
-          # Sanitize secret (strip CR/LF/quotes/spaces)
-          sanitize_one_line() {
-            printf '%s' "${1-}" | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//'
+          sanitize_token_inline() {
+            cleaned="$(cat | tr -d '\r\n' \
+              | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
+              | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g; s/\p{Space}//g')"
+            printf '%s' "$cleaned"
           }
-          API_KEY="$(sanitize_one_line "${OPEN_ROUTER_API_KEY-}")"
+          API_KEY="$(printf '%s' "${OPEN_ROUTER_API_KEY-}" | sanitize_token_inline)"
 
           echo "Has OPEN_ROUTER_API_KEY (secret): $([ -n "${OPEN_ROUTER_API_KEY:-}" ] && echo '✅' || echo '⛔')" >> "$GITHUB_STEP_SUMMARY"
           echo "API key length after sanitize: $(printf '%s' "$API_KEY" | wc -c)" >> "$GITHUB_STEP_SUMMARY"
@@ -102,8 +103,7 @@ jobs:
             local MODELS_CSV="$1"
             IFS=',' read -r -a MODELS <<< "$MODELS_CSV"
             for M in "${MODELS[@]}"; do
-              M="$(echo "$M" | xargs)"
-              [ -n "$M" ] || continue
+              M="$(echo "$M" | xargs)"; [ -n "$M" ] || continue
               echo "→ Trying model: $M" >> "$GITHUB_STEP_SUMMARY"
               for attempt in 1 2 3; do
                 RESP="$(call_model "$M")" || true
@@ -111,12 +111,7 @@ jobs:
                 if [ -n "$ERR_CODE" ]; then
                   echo "  attempt #$attempt error:" >> "$GITHUB_STEP_SUMMARY"
                   echo "$RESP" | jq .error >> "$GITHUB_STEP_SUMMARY"
-                  if [ "$ERR_CODE" = "429" ]; then
-                    sleep $(( 2 ** (attempt + 1) ))
-                    continue
-                  else
-                    break
-                  fi
+                  if [ "$ERR_CODE" = "429" ]; then sleep $(( 2 ** (attempt + 1) )); continue; else break; fi
                 fi
                 OUT="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
                 if [ -n "$OUT" ]; then
