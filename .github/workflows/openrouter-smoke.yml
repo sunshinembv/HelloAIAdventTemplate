@@ -1,4 +1,4 @@
-name: OpenRouter Secret Smoke
+name: OpenRouter Auth Smoke
 
 on:
   workflow_dispatch:
@@ -18,21 +18,54 @@ jobs:
           fi
           echo "✅ Secret OPEN_ROUTER_API_KEY is present."
 
-      - name: Sanitize and call OpenRouter /models
+      - name: Sanitize key and ping /v1/chat/completions (auth required)
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
           set -euo pipefail
+
+          # Аккуратная санитизация: убираем CR/LF, края, zero-width. Внутренние пробелы НЕ трогаем (но их быть не должно).
           cleaned="$(printf '%s' "${OPEN_ROUTER_API_KEY-}" \
             | tr -d '\r\n' \
             | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
-            | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g; s/\p{Space}//g')"
+            | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g')"
+
           echo "API key length after sanitize: $(printf '%s' "$cleaned" | wc -c)"
-          RESP=$(curl -sS https://openrouter.ai/api/v1/models \
+
+          # Минимальный auth-запрос (обязателен ключ): если 401 — ключ битый/пустой
+          MODEL="${LLM_MODEL:-deepseek/deepseek-r1:free}"
+          REQ=$(jq -n --arg m "$MODEL" \
+                 '{model:$m, messages:[{"role":"user","content":"ping"}], max_tokens:16, temperature:0.0}')
+
+          RESP=$(curl -sS -w "\n%{http_code}" https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${cleaned}" \
-            -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
-            -H "X-Title: OpenRouter Smoke")
-          if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-            echo "OpenRouter returned error:"; echo "$RESP" | jq .error; exit 1
+            -H "Content-Type: application/json" \
+            -H "HTTP-Referer: smoke" \
+            -H "X-Title: OpenRouter Smoke" \
+            -d "$REQ")
+
+          BODY=$(printf '%s' "$RESP" | head -n -1)
+          CODE=$(printf '%s' "$RESP" | tail -n 1)
+
+          echo "HTTP: $CODE"
+          if [ "$CODE" -eq 401 ]; then
+            echo "❌ Unauthorized (401). Проверь секрет OPEN_ROUTER_API_KEY."
+            echo "$BODY" | jq .error || echo "$BODY"
+            exit 1
           fi
-          echo "✅ OpenRouter responded ok."
+
+          # Любая другая ошибка — тоже фейлим
+          if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
+            echo "❌ OpenRouter returned error:"
+            echo "$BODY" | jq .error
+            exit 1
+          fi
+
+          # Проверяем, что пришёл текст
+          OUT=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
+          if [ -z "$OUT" ]; then
+            echo "❌ No content in response"; echo "$BODY" | jq .; exit 1
+          fi
+
+          echo "✅ Auth OK. Model: $MODEL; Reply: $(echo "$OUT" | head -c 60)"
