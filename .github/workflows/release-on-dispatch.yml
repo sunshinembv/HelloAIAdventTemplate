@@ -10,25 +10,31 @@ on:
         description: "e.g. v1.0.1"
         required: true
       notes:
-        description: "Release notes (optional)"
+        description: "Release notes (optional). Leave empty to let the CI agent generate."
         required: false
+        default: ""
       generateReleaseNotes:
-        description: "Use auto-generated notes? true/false"
+        description: "Use GitHub auto-generated notes? true/false"
         required: false
         default: "false"
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    permissions: { contents: write }
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "21" }
+        with:
+          distribution: temurin
+          java-version: "21"
+
       - uses: gradle/actions/setup-gradle@v3
 
-      # (A) Соберём контекст: коммиты, PR, diffstat
+      # ---- 1) Сбор контекста для агентной генерации заметок ----
       - name: Collect context for AI notes
         id: ctx
         run: |
@@ -44,7 +50,7 @@ jobs:
           if [ -n "$RANGE" ]; then
             git --no-pager log $RANGE --pretty=format:'- %s (%h) | %an' >> CONTEXT.md
           else
-            git --no-pager log --pretty=format:'- %s (%h) | %an' >> CONTEXT.md
+            git --no-pager log --pretty=format:'- %s (%h) | %an' -n 200 >> CONTEXT.md
           fi
 
           echo -e "\n\n## Diffstat" >> CONTEXT.md
@@ -54,64 +60,65 @@ jobs:
             git diff --shortstat $(git hash-object -t tree /dev/null) HEAD >> CONTEXT.md || true
           fi
 
-          # Ограничим размер, чтобы не переполнить prompt
           head -n 400 CONTEXT.md > CONTEXT_TRIMMED.md
-          echo "path=CONTEXT_TRIMMED.md" >> "$GITHUB_OUTPUT"
 
-      # (B) Сгенерим NOTES, если inputs.notes пустые
+      # ---- 2) Агент генерит заметки, если notes пустые ----
       - name: Generate release notes with LLM (if empty)
         if: ${{ github.event.inputs.notes == '' }}
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
           VERSION_NAME: ${{ github.event.inputs.versionName }}
           TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          [ -n "${OPEN_ROUTER_API_KEY:-}" ] || { echo "OPEN_ROUTER_API_KEY not set"; exit 1; }
+          # Всегда создаём файл, даже если ключа нет
+          if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
+            printf "Key Features:\n- Bug fixes and improvements.\n" > GENERATED_NOTES.md
+            exit 0
+          fi
 
-          SYS_PROMPT='Ты — Release Notes Writer. Кратко и по делу сформируй три секции:
-          1) Key Features — 3–6 маркеров, пользовательски понятные.
-          2) Technical — 3–6 пункта для разработчиков (SDK/миграции/архитектура).
-          3) Breaking Changes — только если есть, иначе строка "None".
-          Формат: Markdown, без прелюдий. Ограничь общий размер до ~1200 символов.'
+          MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
+          SYS_PROMPT='Ты — Release Notes Writer. Сформируй краткие заметки в Markdown с тремя разделами:
+          1) Key Features — 3–6 маркеров (для пользователей).
+          2) Technical — 3–6 пунктов (для разработчиков).
+          3) Breaking Changes — если нет, напиши "None".
+          Без преамбул и заключений. До ~1200 символов.'
 
           USER_PROMPT=$(printf "ВЕРСИЯ: %s (тег %s)\n\nКОНТЕКСТ:\n%s" \
             "$VERSION_NAME" "$TAG" "$(cat CONTEXT_TRIMMED.md)")
 
           JSON=$(jq -n \
-            --arg sys "$SYS_PROMPT" \
-            --arg usr "$USER_PROMPT" \
-            '{
-              "model":"openai/gpt-4o-mini",
-              "messages":[
-                {"role":"system","content":$sys},
-                {"role":"user","content":$usr}
-              ],
-              "temperature":0.2
-            }')
+            --arg m "$MODEL" \
+            --arg s "$SYS_PROMPT" \
+            --arg u "$USER_PROMPT" \
+            '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
 
           RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d "$JSON")
+            -d "$JSON") || true
 
           NOTES=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
-          [ -n "$NOTES" ] || NOTES="Bug fixes and improvements."
+          if [ -z "$NOTES" ]; then
+            NOTES="Key Features:\n- Bug fixes and improvements."
+          fi
           printf "%s" "$NOTES" > GENERATED_NOTES.md
-          echo "AI notes generated:"
-          head -n 50 GENERATED_NOTES.md
 
+      # ---- 3) Обновляем версию проекта ----
       - name: Bump versionName & versionCode
         run: bash scripts/bump_version.sh "${{ github.event.inputs.versionName }}"
 
       - name: Commit version bump
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "chore: bump version to ${{ github.event.inputs.versionName }}" || echo "no changes"
           git push || true
 
+      # ---- 4) Сборки ----
       - name: Build Debug APK (always)
         run: ./gradlew :app:assembleDebug
 
@@ -135,28 +142,42 @@ jobs:
             echo "Signing secrets not present — skipping :app:bundleRelease"
           fi
 
+      # ---- 5) Готовим итоговый файл с заметками для релиза ----
+      - name: Prepare release body file
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.notes }}" ]; then
+            printf "%s" "${{ github.event.inputs.notes }}" > RELEASE_NOTES.md
+          elif [ -f GENERATED_NOTES.md ]; then
+            cp GENERATED_NOTES.md RELEASE_NOTES.md
+          else
+            printf "Bug fixes and improvements.\n" > RELEASE_NOTES.md
+          fi
+          echo "Using notes file:"
+          wc -c RELEASE_NOTES.md || true
+
+      # ---- 6) Создаём GitHub Release и загружаем артефакты ----
       - name: Create GitHub Release (+upload)
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ github.event.inputs.tag }}
           name: ${{ github.event.inputs.versionName }}
-          bodyFile: ${{ github.event.inputs.notes != '' && '' || 'GENERATED_NOTES.md' }}
-          body: ${{ github.event.inputs.notes }}
+          bodyFile: RELEASE_NOTES.md
           allowUpdates: true
-          generateReleaseNotes: false
+          generateReleaseNotes: ${{ github.event.inputs.generateReleaseNotes }}
+          artifactErrorsFailBuild: false
           artifacts: |
             app/build/outputs/apk/debug/**/*.apk
             app/build/outputs/bundle/release/**/*.aab
 
-      # Notion — тоже проверяем внутри шага
+      # ---- 7) (Опционально) Запись в Notion, если заданы секрет/переменная ----
       - name: Post to Notion (optional)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB: ${{ vars.NOTION_DB_RELEASES }}
-          TAG:   ${{ github.event.inputs.tag }}
-          VER:   ${{ github.event.inputs.versionName }}
-          URL:   ${{ format('https://github.com/{0}/releases/tag/{1}', github.repository, github.event.inputs.tag) }}
-          NOTES: ${{ github.event.inputs.notes }}
+          TAG:  ${{ github.event.inputs.tag }}
+          VER:  ${{ github.event.inputs.versionName }}
+          URL:  ${{ format('https://github.com/{0}/releases/tag/{1}', github.repository, github.event.inputs.tag) }}
         run: |
           set -euo pipefail
           if [ -z "${NOTION_TOKEN:-}" ] || [ -z "${NOTION_DB:-}" ]; then
@@ -164,13 +185,15 @@ jobs:
             exit 0
           fi
 
+          NOTES_TEXT=$(sed -e 's/"/\\"/g' RELEASE_NOTES.md | tr -d '\r' | head -c 4000)
+
           NOW=$(date -u +%FT%TZ)
           DATA=$(jq -n \
             --arg db "$NOTION_DB" \
             --arg ver "$VER" \
             --arg tag "$TAG" \
             --arg url "$URL" \
-            --arg notes "${NOTES:-See GitHub release}" \
+            --arg notes "$NOTES_TEXT" \
             --arg now "$NOW" '
             {
               parent: { database_id: $db },
