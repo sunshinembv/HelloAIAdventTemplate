@@ -34,17 +34,13 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v3
 
-      # ---- 1) Сбор контекста для агентной генерации заметок ----
+      # 1) Контекст для AI заметок
       - name: Collect context for AI notes
         id: ctx
         run: |
           set -euo pipefail
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -n "$LAST_TAG" ]; then
-            RANGE="$LAST_TAG..HEAD"
-          else
-            RANGE=""
-          fi
+          if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..HEAD"; else RANGE=""; fi
 
           echo "## Commit log" > CONTEXT.md
           if [ -n "$RANGE" ]; then
@@ -62,50 +58,76 @@ jobs:
 
           head -n 400 CONTEXT.md > CONTEXT_TRIMMED.md
 
-      # ---- 2) Агент генерит заметки, если notes пустые ----
+      # 2) Генерация заметок (если notes пустые) — c fallback r1
       - name: Generate release notes with LLM (if empty)
         if: ${{ github.event.inputs.notes == '' }}
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_FALLBACKS: ${{ vars.LLM_FALLBACKS }}
           VERSION_NAME: ${{ github.event.inputs.versionName }}
           TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          # Всегда создаём файл, даже если ключа нет
-          if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
+          sanitize_one_line() {
+            printf '%s' "${1-}" | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//'
+          }
+          API_KEY="$(sanitize_one_line "${OPEN_ROUTER_API_KEY-}")"
+
+          if [ -z "$API_KEY" ]; then
             printf "Key Features:\n- Bug fixes and improvements.\n" > GENERATED_NOTES.md
             exit 0
           fi
 
-          MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
-          SYS_PROMPT='Ты — Release Notes Writer. Сформируй краткие заметки в Markdown с тремя разделами:
+          DEF_PRIMARY="deepseek/deepseek-chat-v3-0324:free"
+          DEF_FALLBACKS="deepseek/deepseek-r1:free"
+          PRIMARY="${LLM_MODEL:-$DEF_PRIMARY}"
+          FALLBACKS="${LLM_FALLBACKS:-$DEF_FALLBACKS}"
+
+          SYS='Ты — Release Notes Writer. Сформируй краткие заметки в Markdown с тремя разделами:
           1) Key Features — 3–6 маркеров (для пользователей).
           2) Technical — 3–6 пунктов (для разработчиков).
           3) Breaking Changes — если нет, напиши "None".
           Без преамбул и заключений. До ~1200 символов.'
 
-          USER_PROMPT=$(printf "ВЕРСИЯ: %s (тег %s)\n\nКОНТЕКСТ:\n%s" \
-            "$VERSION_NAME" "$TAG" "$(cat CONTEXT_TRIMMED.md)")
+          USER=$(printf "ВЕРСИЯ: %s (тег %s)\n\nКОНТЕКСТ:\n%s" "$VERSION_NAME" "$TAG" "$(cat CONTEXT_TRIMMED.md)")
 
-          JSON=$(jq -n \
-            --arg m "$MODEL" \
-            --arg s "$SYS_PROMPT" \
-            --arg u "$USER_PROMPT" \
-            '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
+          call_model() {
+            local M="$1"
+            local JSON=$(jq -n --arg s "$SYS" --arg u "$USER" --arg m "$M" \
+              '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
+            curl -sS https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer ${API_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
+              -H "X-Title: Release Notes Generator" \
+              -d "$JSON"
+          }
 
-          RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "$JSON") || true
+          try_models() {
+            local MODELS_CSV="$1"
+            IFS=',' read -r -a MODELS <<< "$MODELS_CSV"
+            for M in "${MODELS[@]}"; do
+              M="$(echo "$M" | xargs)"; [ -n "$M" ] || continue
+              for attempt in 1 2 3; do
+                RESP="$(call_model "$M")" || true
+                ERR_CODE="$(echo "$RESP" | jq -r '.error.code // empty' 2>/dev/null || true)"
+                if [ -n "$ERR_CODE" ]; then
+                  if [ "$ERR_CODE" = "429" ]; then sleep $(( 2 ** (attempt + 1) )); continue; else break; fi
+                fi
+                NOTES="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
+                if [ -n "$NOTES" ]; then printf "%s" "$NOTES" > GENERATED_NOTES.md; return 0; fi
+                sleep $(( 2 ** (attempt + 1) ))
+              done
+            done
+            return 1
+          }
 
-          NOTES=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
-          if [ -z "$NOTES" ]; then
-            NOTES="Key Features:\n- Bug fixes and improvements."
+          if try_models "$PRIMARY"; then :; elif try_models "$FALLBACKS"; then :; else
+            printf "Key Features:\n- Bug fixes and improvements.\n" > GENERATED_NOTES.md
           fi
-          printf "%s" "$NOTES" > GENERATED_NOTES.md
 
-      # ---- 3) Обновляем версию проекта ----
+      # 3) Bump версий
       - name: Bump versionName & versionCode
         run: bash scripts/bump_version.sh "${{ github.event.inputs.versionName }}"
 
@@ -118,7 +140,7 @@ jobs:
           git commit -m "chore: bump version to ${{ github.event.inputs.versionName }}" || echo "no changes"
           git push || true
 
-      # ---- 4) Сборки ----
+      # 4) Сборки
       - name: Build Debug APK (always)
         run: ./gradlew :app:assembleDebug
 
@@ -142,7 +164,7 @@ jobs:
             echo "Signing secrets not present — skipping :app:bundleRelease"
           fi
 
-      # ---- 5) Готовим итоговый файл с заметками для релиза ----
+      # 5) Итоговый body
       - name: Prepare release body file
         run: |
           set -euo pipefail
@@ -153,10 +175,9 @@ jobs:
           else
             printf "Bug fixes and improvements.\n" > RELEASE_NOTES.md
           fi
-          echo "Using notes file:"
           wc -c RELEASE_NOTES.md || true
 
-      # ---- 6) Создаём GitHub Release и загружаем артефакты ----
+      # 6) Release + upload
       - name: Create GitHub Release (+upload)
         uses: ncipollo/release-action@v1
         with:
@@ -170,7 +191,7 @@ jobs:
             app/build/outputs/apk/debug/**/*.apk
             app/build/outputs/bundle/release/**/*.aab
 
-      # ---- 7) (Опционально) Запись в Notion, если заданы секрет/переменная ----
+      # 7) (опц.) Notion
       - name: Post to Notion (optional)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -184,31 +205,20 @@ jobs:
             echo "Notion token or DB missing — skipping Notion step"
             exit 0
           fi
-
           NOTES_TEXT=$(sed -e 's/"/\\"/g' RELEASE_NOTES.md | tr -d '\r' | head -c 4000)
-
           NOW=$(date -u +%FT%TZ)
-          DATA=$(jq -n \
-            --arg db "$NOTION_DB" \
-            --arg ver "$VER" \
-            --arg tag "$TAG" \
-            --arg url "$URL" \
-            --arg notes "$NOTES_TEXT" \
-            --arg now "$NOW" '
-            {
-              parent: { database_id: $db },
-              properties: {
-                "Name": { title: [{ type: "text", text: { content: $ver } }] },
-                "Tag":  { rich_text: [{ type: "text", text: { content: $tag } }] },
-                "Release URL": { url: $url },
-                "Released": { date: { start: $now } }
+          DATA=$(jq -n --arg db "$NOTION_DB" --arg ver "$VER" --arg tag "$TAG" --arg url "$URL" --arg notes "$NOTES_TEXT" --arg now "$NOW" '
+            { parent:{database_id:$db},
+              properties:{
+                "Name":{title:[{type:"text",text:{content:$ver}}]},
+                "Tag":{rich_text:[{type:"text",text:{content:$tag}}]},
+                "Release URL":{url:$url},
+                "Released":{date:{start:$now}}
               },
-              children: [
-                { object:"block", type:"heading_2", heading_2:{ rich_text:[{ type:"text", text:{ content:"Changelog" } }] } },
-                { object:"block", type:"paragraph", paragraph:{ rich_text:[{ type:"text", text:{ content:$notes } }] } }
-              ]
-            }')
-
+              children:[
+                {object:"block",type:"heading_2",heading_2:{rich_text:[{type:"text",text:{content:"Changelog"}}]}},
+                {object:"block",type:"paragraph",paragraph:{rich_text:[{type:"text",text:{content:$notes}}]}}
+              ] }')
           curl -sS -X POST "https://api.notion.com/v1/pages" \
             -H "Authorization: Bearer ${NOTION_TOKEN}" \
             -H "Content-Type: application/json" \
