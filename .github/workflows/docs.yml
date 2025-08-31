@@ -4,26 +4,59 @@ on:
   push:
     branches: [ "main" ]
 
-permissions: { contents: write }
+permissions:
+  contents: write
 
 jobs:
   docs:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "21" }
       - uses: gradle/actions/setup-gradle@v3
 
-      - name: Build Dokka
-        run: ./gradlew dokkaHtml
+      # 1) Собираем Dokka, авто-определяем доступную задачу и выходной каталог
+      - name: Build Dokka (auto-detect task)
+        id: dokka
+        run: |
+          set -euo pipefail
 
+          detect() {
+            ./gradlew -q tasks --all > tasks.txt
+            if grep -qE '^dokkaHtml[[:space:]]' tasks.txt; then
+              echo "task=dokkaHtml"
+              echo "out=build/dokka/html"
+              return 0
+            fi
+            if grep -qE '^dokkaHtmlMultiModule[[:space:]]' tasks.txt; then
+              echo "task=dokkaHtmlMultiModule"
+              echo "out=build/dokka/htmlMultiModule"
+              return 0
+            fi
+            if grep -qE '^[[:space:]]*:app:dokkaHtml[[:space:]]' tasks.txt; then
+              echo "task=:app:dokkaHtml"
+              echo "out=app/build/dokka/html"
+              return 0
+            fi
+            return 1
+          }
+
+          eval "$(detect)" || { echo "No Dokka task found. Did you apply the plugin?"; cat tasks.txt; exit 1; }
+          echo "Using task: $task"
+          ./gradlew "$task"
+
+          echo "OUT_DIR=$out" >> "$GITHUB_OUTPUT"
+
+      # 2) Собираем контекст изменений (для краткой AI-выжимки фич)
       - name: Collect recent changes
         run: |
           set -euo pipefail
           git fetch --tags --depth=1 || true
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..HEAD"; else RANGE=""; fi
+
           echo "### Changes since $LAST_TAG" > DOCS_CONTEXT.md
           if [ -n "$RANGE" ]; then
             git --no-pager log $RANGE --pretty=format:'- %s' >> DOCS_CONTEXT.md
@@ -32,29 +65,43 @@ jobs:
           fi
           head -n 300 DOCS_CONTEXT.md > DOCS_CTX_TRIMMED.md
 
+      # 3) Короткая AI-выжимка "Key Features" (бесплатная модель по умолчанию)
       - name: AI Key Features (short)
         env:
           OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
           set -euo pipefail
+          mkdir -p docs
           if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
-            echo "_AI summary unavailable_" > docs/KEY_FEATURES.md
+            echo "- Bug fixes and improvements." > docs/KEY_FEATURES.md
           else
-            SYS='Сформируй короткий раздел "**Key Features**" (5-7 bullets) по последним изменениям. Только маркдаун-список.'
+            MODEL="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
+            SYS='Сформируй раздел "**Key Features**" (5–7 bullets) по последним изменениям. Только маркированный список (Markdown).'
             USR=$(cat DOCS_CTX_TRIMMED.md)
-            JSON=$(jq -n --arg s "$SYS" --arg u "$USR" \
-              '{model:"openai/gpt-4o-mini",messages:[{"role":"system","content":$s},{"role":"user","content":$u}],temperature:0.2}')
+
+            JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$MODEL" \
+              '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
+
             RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
-              -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" -H "Content-Type: application/json" -d "$JSON")
+              -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$JSON") || true
+
             OUT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
-            mkdir -p docs
-            printf "%s\n" "${OUT:-_AI summary unavailable_}" > docs/KEY_FEATURES.md
+            if [ -z "$OUT" ]; then OUT="- Bug fixes and improvements."; fi
+            printf "%s\n" "$OUT" > docs/KEY_FEATURES.md
           fi
-          # приложим к gh-pages
+
+      # 4) Готовим папку для публикации (берём OUT_DIR из шага Dokka)
+      - name: Prepare site
+        run: |
+          set -euo pipefail
           mkdir -p public
-          cp -R build/dokka/html/* public/
+          cp -R "${{ steps.dokka.outputs.OUT_DIR }}"/* public/ || true
           cp docs/KEY_FEATURES.md public/KEY_FEATURES.md
 
+      # 5) Публикация на GitHub Pages
       - name: Deploy to GitHub Pages (gh-pages)
         uses: peaceiris/actions-gh-pages@v3
         with:
