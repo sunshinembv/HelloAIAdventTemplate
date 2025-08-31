@@ -20,18 +20,86 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    permissions: { contents: write }
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
+        with: { distribution: temurin, java-version: "21" }
       - uses: gradle/actions/setup-gradle@v3
+
+      # (A) Соберём контекст: коммиты, PR, diffstat
+      - name: Collect context for AI notes
+        id: ctx
+        run: |
+          set -euo pipefail
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="$LAST_TAG..HEAD"
+          else
+            RANGE=""
+          fi
+
+          echo "## Commit log" > CONTEXT.md
+          if [ -n "$RANGE" ]; then
+            git --no-pager log $RANGE --pretty=format:'- %s (%h) | %an' >> CONTEXT.md
+          else
+            git --no-pager log --pretty=format:'- %s (%h) | %an' >> CONTEXT.md
+          fi
+
+          echo -e "\n\n## Diffstat" >> CONTEXT.md
+          if [ -n "$RANGE" ]; then
+            git diff --shortstat $RANGE >> CONTEXT.md || true
+          else
+            git diff --shortstat $(git hash-object -t tree /dev/null) HEAD >> CONTEXT.md || true
+          fi
+
+          # Ограничим размер, чтобы не переполнить prompt
+          head -n 400 CONTEXT.md > CONTEXT_TRIMMED.md
+          echo "path=CONTEXT_TRIMMED.md" >> "$GITHUB_OUTPUT"
+
+      # (B) Сгенерим NOTES, если inputs.notes пустые
+      - name: Generate release notes with LLM (if empty)
+        if: ${{ github.event.inputs.notes == '' }}
+        env:
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          VERSION_NAME: ${{ github.event.inputs.versionName }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          [ -n "${OPEN_ROUTER_API_KEY:-}" ] || { echo "OPEN_ROUTER_API_KEY not set"; exit 1; }
+
+          SYS_PROMPT='Ты — Release Notes Writer. Кратко и по делу сформируй три секции:
+          1) Key Features — 3–6 маркеров, пользовательски понятные.
+          2) Technical — 3–6 пункта для разработчиков (SDK/миграции/архитектура).
+          3) Breaking Changes — только если есть, иначе строка "None".
+          Формат: Markdown, без прелюдий. Ограничь общий размер до ~1200 символов.'
+
+          USER_PROMPT=$(printf "ВЕРСИЯ: %s (тег %s)\n\nКОНТЕКСТ:\n%s" \
+            "$VERSION_NAME" "$TAG" "$(cat CONTEXT_TRIMMED.md)")
+
+          JSON=$(jq -n \
+            --arg sys "$SYS_PROMPT" \
+            --arg usr "$USER_PROMPT" \
+            '{
+              "model":"openai/gpt-4o-mini",
+              "messages":[
+                {"role":"system","content":$sys},
+                {"role":"user","content":$usr}
+              ],
+              "temperature":0.2
+            }')
+
+          RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$JSON")
+
+          NOTES=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+          [ -n "$NOTES" ] || NOTES="Bug fixes and improvements."
+          printf "%s" "$NOTES" > GENERATED_NOTES.md
+          echo "AI notes generated:"
+          head -n 50 GENERATED_NOTES.md
 
       - name: Bump versionName & versionCode
         run: bash scripts/bump_version.sh "${{ github.event.inputs.versionName }}"
@@ -47,7 +115,6 @@ jobs:
       - name: Build Debug APK (always)
         run: ./gradlew :app:assembleDebug
 
-      # ВАЖНО: проверяем секреты внутри скрипта, а не в if:
       - name: Build Release Bundle if signing secrets present
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -73,9 +140,10 @@ jobs:
         with:
           tag: ${{ github.event.inputs.tag }}
           name: ${{ github.event.inputs.versionName }}
+          bodyFile: ${{ github.event.inputs.notes != '' && '' || 'GENERATED_NOTES.md' }}
           body: ${{ github.event.inputs.notes }}
           allowUpdates: true
-          generateReleaseNotes: ${{ github.event.inputs.generateReleaseNotes }}
+          generateReleaseNotes: false
           artifacts: |
             app/build/outputs/apk/debug/**/*.apk
             app/build/outputs/bundle/release/**/*.aab
