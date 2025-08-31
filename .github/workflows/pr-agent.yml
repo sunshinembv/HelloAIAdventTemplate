@@ -1,0 +1,89 @@
+name: PR AI Summary
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  summarize:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Build prompt
+        id: build
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          TITLE="${{ github.event.pull_request.title }}"
+          BODY=$(printf "%s" "${{ github.event.pull_request.body }}" | head -c 5000)
+
+          echo "### PR Title"       > PR_CONTEXT.md
+          echo "$TITLE"            >> PR_CONTEXT.md
+          echo -e "\n### PR Body\n$BODY" >> PR_CONTEXT.md
+          echo -e "\n### Diffstat" >> PR_CONTEXT.md
+          git diff --shortstat "$BASE_SHA" "$HEAD_SHA" >> PR_CONTEXT.md || true
+          echo -e "\n### Commits" >> PR_CONTEXT.md
+          git log --oneline "$BASE_SHA".."$HEAD_SHA" >> PR_CONTEXT.md || true
+          head -n 400 PR_CONTEXT.md > PR_CTX_TRIMMED.md
+
+      - name: Call LLM
+        env:
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${OPEN_ROUTER_API_KEY:-}" ] || { echo "OPEN_ROUTER_API_KEY not set"; exit 0; }
+
+          SYS='Ты — помощник ревьюера. Сформируй Markdown-ответ:
+          1) Summary (2–4 пункта).
+          2) Risk & Impact (что может сломаться).
+          3) Test checklist (чекбоксами).
+          4) Suggested labels (через запятую, из: feature, bugfix, docs, chore, perf, refactor, test).'
+
+          USR=$(printf "Контекст PR:\n%s" "$(cat PR_CTX_TRIMMED.md)")
+          JSON=$(jq -n --arg s "$SYS" --arg u "$USR" \
+            '{model:"openai/gpt-4o-mini",messages:[{"role":"system","content":$s},{"role":"user","content":$u}],temperature:0.2}')
+
+          RESP=$(curl -sS https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer ${OPEN_ROUTER_API_KEY}" -H "Content-Type: application/json" -d "$JSON")
+          OUT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+          printf "%s" "${OUT:-_AI summary unavailable_}" > AI_SUMMARY.md
+
+      - name: Comment summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('AI_SUMMARY.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+      - name: Apply labels (best-effort)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const text = fs.readFileSync('AI_SUMMARY.md','utf8');
+            const m = text.match(/Suggested labels:\s*(.+)/i);
+            if (m) {
+              const labels = m[1].split(',').map(s => s.trim()).filter(Boolean);
+              if (labels.length) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  labels
+                });
+              }
+            }
